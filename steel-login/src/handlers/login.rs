@@ -240,6 +240,7 @@ impl JavaTcpClient {
         self.send_bare_packet_now(CLoginFinished::new(
             profile,
             self.connection_session.session_id(),
+            true,
         ))
         .await;
     }

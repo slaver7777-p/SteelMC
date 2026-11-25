@@ -2,6 +2,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use steel_protocol::legacy::{column_for, remap_serverbound, translation_for};
 use steel_protocol::packet_reader::TCPNetworkDecoder;
 use steel_protocol::packet_traits::{ClientPacket, CompressionInfo, EncodedPacket, ServerPacket};
 use steel_protocol::packet_writer::TCPNetworkEncoder;
@@ -26,6 +27,7 @@ use crate::player::connection::NetworkConnection;
 use crate::player::{Player, PlayerSession};
 use crate::server::Server;
 use steel_protocol::utils::{ConnectionProtocol, PacketError, RawPacket};
+use steel_protocol::version::MinecraftVersion;
 use steel_registry::packets::play;
 use steel_utils::locks::{AsyncMutex, SyncMutex};
 use steel_utils::translations;
@@ -356,25 +358,45 @@ impl ScheduledPlayPacket {
 pub struct BundleBuilder {
     packets: Vec<EncodedPacket>,
     compression: Option<CompressionInfo>,
+    legacy: Option<MinecraftVersion>,
 }
 
 impl BundleBuilder {
-    /// Creates a new `BundleBuilder` with the given compression settings.
+    /// Creates a new `BundleBuilder` for a client on `legacy` (`None` = native).
     #[must_use]
-    pub const fn new(compression: Option<CompressionInfo>) -> Self {
+    pub const fn new(
+        compression: Option<CompressionInfo>,
+        legacy: Option<MinecraftVersion>,
+    ) -> Self {
         Self {
             packets: Vec::new(),
             compression,
+            legacy,
         }
     }
 
     /// Adds a packet to the bundle.
     ///
+    /// Packets the client's protocol version does not have are skipped.
+    ///
     /// # Panics
     /// Panics if the packet fails to encode.
     pub fn add<P: ClientPacket>(&mut self, packet: P) {
-        let encoded = EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-            .expect("Failed to encode packet");
+        let encoded = match self.legacy {
+            None => EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play),
+            Some(version) => {
+                match EncodedPacket::from_bare_for(
+                    packet,
+                    self.compression,
+                    ConnectionProtocol::Play,
+                    version,
+                ) {
+                    Err(PacketError::LegacyPacketUnsupported(_)) => return,
+                    result => result,
+                }
+            }
+        }
+        .expect("Failed to encode packet");
         self.packets.push(encoded);
     }
 
@@ -402,6 +424,10 @@ pub struct JavaConnection {
     compression: Option<CompressionInfo>,
     network_writer: JavaNetworkWriter,
     id: u64,
+    /// Set when the client needs packet translation, i.e. it is on an older protocol whose
+    /// packet-id matrix was extracted. `None` for a native client, so its send path stays
+    /// byte-identical to a server without multiversion support.
+    legacy: Option<MinecraftVersion>,
 
     session: Arc<PlayerSession>,
     keep_alive_tracker: SyncMutex<KeepAliveTracker>,
@@ -409,7 +435,7 @@ pub struct JavaConnection {
 }
 
 impl JavaConnection {
-    /// Creates a new `JavaConnection`.
+    /// Creates a new `JavaConnection` for a client on `version`.
     pub const fn new(
         outgoing_packets: UnboundedSender<OutboundPacket>,
         cancel_token: CancellationToken,
@@ -417,6 +443,7 @@ impl JavaConnection {
         network_writer: JavaNetworkWriter,
         id: u64,
         session: Arc<PlayerSession>,
+        version: MinecraftVersion,
     ) -> Self {
         Self {
             outgoing_packets,
@@ -424,6 +451,7 @@ impl JavaConnection {
             compression,
             network_writer,
             id,
+            legacy: translation_for(version),
             session,
             keep_alive_tracker: SyncMutex::new(KeepAliveTracker {
                 alive_time: 0,
@@ -432,6 +460,37 @@ impl JavaConnection {
             }),
             latency: SyncMutex::new(0),
         }
+    }
+
+    /// The client's protocol version this connection translates packets for.
+    #[must_use]
+    pub const fn version(&self) -> MinecraftVersion {
+        match self.legacy {
+            Some(version) => version,
+            None => MinecraftVersion::CURRENT,
+        }
+    }
+
+    /// Encodes `packet` for this client, translating its id when the client is on an older
+    /// protocol. Returns `Ok(None)` when the client's version has no such packet.
+    fn encode_for_client<P: ClientPacket>(
+        &self,
+        packet: P,
+    ) -> Result<Option<EncodedPacket>, PacketError> {
+        let encoded = match self.legacy {
+            None => EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)?,
+            Some(version) => match EncodedPacket::from_bare_for(
+                packet,
+                self.compression,
+                ConnectionProtocol::Play,
+                version,
+            ) {
+                Ok(encoded) => encoded,
+                Err(PacketError::LegacyPacketUnsupported(_)) => return Ok(None),
+                Err(err) => return Err(err),
+            },
+        };
+        Ok(Some(encoded))
     }
 
     async fn write_packet_now(&self, packet: &EncodedPacket) -> Result<(), PacketError> {
@@ -522,12 +581,13 @@ impl JavaConnection {
 
     /// Disconnects the client.
     pub fn disconnect(&self, reason: impl Into<TextComponent>) {
-        let packet = match EncodedPacket::from_bare(
-            CDisconnect::new(&reason.into(), self),
-            self.compression,
-            ConnectionProtocol::Play,
-        ) {
-            Ok(packet) => packet,
+        let packet = match self.encode_for_client(CDisconnect::new(&reason.into(), self)) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                // The client's version predates the play disconnect packet; close directly.
+                self.close();
+                return;
+            }
             Err(err) => {
                 log::warn!(
                     "Failed to encode disconnect packet for client {}: {err}",
@@ -550,12 +610,17 @@ impl JavaConnection {
 
     /// Sends a packet to the client.
     ///
+    /// Packets the client's protocol version does not have are dropped silently.
+    ///
     /// # Panics
     /// - If the packet fails to be encoded.
     /// - If the packet fails to be sent through the channel.
     pub fn send_packet<P: ClientPacket>(&self, packet: P) {
-        let packet = EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-            .expect("Failed to encode packet");
+        let packet = match self.encode_for_client(packet) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return,
+            Err(err) => panic!("Failed to encode packet: {err}"),
+        };
         if self
             .outgoing_packets
             .send(OutboundPacket::Packet(packet))
@@ -625,12 +690,28 @@ impl JavaConnection {
         player: Arc<Player>,
         server: &Server,
     ) -> Result<(), PacketError> {
+        // A legacy client numbers play packets differently; translate the id before any
+        // gating or decoding, which all key off the server's own numbering.
+        let packet = match self.legacy {
+            None => packet,
+            Some(version) => {
+                let Some(column) = column_for(version) else {
+                    return Ok(());
+                };
+                match remap_serverbound(column, ConnectionProtocol::Play, packet.id) {
+                    Some(current_id) => packet.with_id(current_id),
+                    None => return Ok(()),
+                }
+            }
+        };
+
         if !player.has_joined_world() && !Self::can_process_before_join(packet.id) {
             return Ok(());
         }
 
         let payload_bytes = packet.payload().len();
-        let Some(packet) = Self::decode_domain_gated_packet(packet, &player)? else {
+        let Some(packet) = Self::decode_domain_gated_packet(packet, &player, self.version())?
+        else {
             return Ok(());
         };
 
@@ -648,11 +729,12 @@ impl JavaConnection {
     fn decode_domain_gated_packet(
         packet: RawPacket,
         player: &Player,
+        version: MinecraftVersion,
     ) -> Result<Option<DecodedPlayPacket>, PacketError> {
         let maintenance_packet = matches!(packet.id, play::S_KEEP_ALIVE | play::S_PING_REQUEST);
         let handshake_packet = Self::can_process_during_domain_handshake(packet.id);
         if packet.id == play::S_CLIENT_COMMAND {
-            let decoded = Self::decode_play_packet(packet)?;
+            let decoded = Self::decode_play_packet(packet, version)?;
             let perform_respawn = matches!(
                 &decoded,
                 DecodedPlayPacket::Scheduled(packet) if packet.is_perform_respawn()
@@ -667,14 +749,17 @@ impl JavaConnection {
             return Ok(None);
         }
 
-        Self::decode_play_packet(packet).map(Some)
+        Self::decode_play_packet(packet, version).map(Some)
     }
 
     #[expect(
         clippy::too_many_lines,
         reason = "single match decode over all implemented play packets keeps protocol routing auditable"
     )]
-    fn decode_play_packet(packet: RawPacket) -> Result<DecodedPlayPacket, PacketError> {
+    fn decode_play_packet(
+        packet: RawPacket,
+        version: MinecraftVersion,
+    ) -> Result<DecodedPlayPacket, PacketError> {
         let data = &mut Cursor::new(packet.payload());
         let scheduled = |packet| DecodedPlayPacket::Scheduled(ScheduledPlayPacket(packet));
 
@@ -745,18 +830,18 @@ impl JavaConnection {
             )),
             play::S_CONTAINER_BUTTON_CLICK => {
                 scheduled(ScheduledPlayPacketKind::ContainerButtonClick(
-                    SContainerButtonClick::read_packet(data)?,
+                    SContainerButtonClick::read_packet_for(data, version)?,
                 ))
             }
             play::S_CONTAINER_CLICK => scheduled(ScheduledPlayPacketKind::ContainerClick(
-                SContainerClick::read_packet(data)?,
+                SContainerClick::read_packet_for(data, version)?,
             )),
             play::S_CONTAINER_CLOSE => scheduled(ScheduledPlayPacketKind::ContainerClose(
-                SContainerClose::read_packet(data)?,
+                SContainerClose::read_packet_for(data, version)?,
             )),
             play::S_CONTAINER_SLOT_STATE_CHANGED => {
                 scheduled(ScheduledPlayPacketKind::ContainerSlotStateChanged(
-                    SContainerSlotStateChanged::read_packet(data)?,
+                    SContainerSlotStateChanged::read_packet_for(data, version)?,
                 ))
             }
             play::S_SET_CREATIVE_MODE_SLOT => {
@@ -948,6 +1033,10 @@ impl NetworkConnection for JavaConnection {
         self.compression
     }
 
+    fn legacy_version(&self) -> Option<MinecraftVersion> {
+        self.legacy
+    }
+
     fn send_encoded(&self, packet: EncodedPacket) {
         self.send_encoded_packet(packet);
     }
@@ -1006,7 +1095,8 @@ mod tests {
     use super::*;
 
     fn decode(packet: RawPacket) -> DecodedPlayPacket {
-        let Ok(decoded) = JavaConnection::decode_play_packet(packet) else {
+        let Ok(decoded) = JavaConnection::decode_play_packet(packet, MinecraftVersion::CURRENT)
+        else {
             panic!("test play packet should decode");
         };
         decoded
@@ -1043,6 +1133,7 @@ mod tests {
                 vec![ClientCommandAction::RequestStats as u8],
             ),
             &player,
+            MinecraftVersion::CURRENT,
         );
         assert!(matches!(request_stats, Ok(None)));
         assert!(!player.has_deferred_death_respawn_for_test());
@@ -1053,6 +1144,7 @@ mod tests {
                 vec![ClientCommandAction::PerformRespawn as u8],
             ),
             &player,
+            MinecraftVersion::CURRENT,
         );
         assert!(matches!(perform_respawn, Ok(None)));
         assert!(player.has_deferred_death_respawn_for_test());
@@ -1418,6 +1510,7 @@ mod tests {
             network_writer,
             1,
             Arc::new(PlayerSession::new(10, 10)),
+            MinecraftVersion::CURRENT,
         ));
         let sender = task::spawn({
             let connection = Arc::clone(&connection);

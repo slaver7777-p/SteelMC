@@ -14,6 +14,9 @@ use steel_macros::{ClientPacket, WriteTo};
 use steel_math::{DEGREE_360, round_f64};
 use steel_registry::packets::play::{C_MOVE_ENTITY_POS, C_MOVE_ENTITY_POS_ROT, C_MOVE_ENTITY_ROT};
 use steel_utils::codec::VarInt;
+use steel_utils::serial::WriteTo as _;
+
+use crate::version::MinecraftVersion;
 
 /// Fixed-point encoding multiplier (1/4096 block precision).
 const TRUNCATION_STEPS: f64 = 4096.0;
@@ -73,6 +76,33 @@ impl VecDelta {
         }
     }
 
+    /// Collapses this delta into the single linear offset older clients understand.
+    ///
+    /// Stepped paths only exist since 26.3. A pre-26.3 client moves straight to the end
+    /// position, which is exactly how those versions always moved, so the steps are summed.
+    /// Returns an error when the summed offset leaves the protocol's `i16` range: the packet
+    /// must then be dropped rather than sent with a wrong offset.
+    pub fn legacy_linear(
+        &self,
+    ) -> io::Result<(PackedEntityDelta, PackedEntityDelta, PackedEntityDelta)> {
+        match self {
+            Self::Linear { dx, dy, dz } => Ok((*dx, *dy, *dz)),
+            Self::Stepped(steps) => {
+                let (mut dx, mut dy, mut dz) = (0_i32, 0_i32, 0_i32);
+                for step in steps {
+                    dx += i32::from(step.dx.as_i16());
+                    dy += i32::from(step.dy.as_i16());
+                    dz += i32::from(step.dz.as_i16());
+                }
+                Ok((
+                    PackedEntityDelta::from_sum(dx)?,
+                    PackedEntityDelta::from_sum(dy)?,
+                    PackedEntityDelta::from_sum(dz)?,
+                ))
+            }
+        }
+    }
+
     /// Packs the on-ground flag and the step count into the `properties` field.
     fn pack_properties(&self, on_ground: bool) -> i32 {
         i32::from(on_ground) | (self.step_count() << 1)
@@ -106,6 +136,7 @@ impl steel_utils::serial::WriteTo for VecDelta {
 /// bit 0 and the delta's step count into the upper bits, then the delta itself.
 #[derive(ClientPacket, Clone, Debug)]
 #[packet_id(Play = C_MOVE_ENTITY_POS)]
+#[legacy_payload]
 pub struct CMoveEntityPos {
     /// The entity being moved.
     pub entity_id: i32,
@@ -113,6 +144,32 @@ pub struct CMoveEntityPos {
     pub delta: VecDelta,
     /// Whether the entity is on the ground.
     pub on_ground: bool,
+}
+
+impl CMoveEntityPos {
+    /// Writes the body for a client on an older protocol version.
+    ///
+    /// Before 26.3 there is no `properties` field and no stepped path: the packet is the
+    /// entity id, one linear delta and the on-ground flag. A stepped delta is summed into
+    /// that single offset, and dropped if the sum does not fit.
+    ///
+    /// # Errors
+    /// - If the packet fails to write or the summed delta overflows.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl Write,
+        version: MinecraftVersion,
+    ) -> io::Result<()> {
+        if version.at_least(MinecraftVersion::V26_3) {
+            return self.write(writer);
+        }
+        VarInt(self.entity_id).write(writer)?;
+        let (dx, dy, dz) = self.delta.legacy_linear()?;
+        dx.write(writer)?;
+        dy.write(writer)?;
+        dz.write(writer)?;
+        self.on_ground.write(writer)
+    }
 }
 
 impl steel_utils::serial::WriteTo for CMoveEntityPos {
@@ -129,6 +186,7 @@ impl steel_utils::serial::WriteTo for CMoveEntityPos {
 /// the rotation as angle bytes.
 #[derive(ClientPacket, Clone, Debug)]
 #[packet_id(Play = C_MOVE_ENTITY_POS_ROT)]
+#[legacy_payload]
 pub struct CMoveEntityPosRot {
     /// The entity being moved.
     pub entity_id: i32,
@@ -140,6 +198,33 @@ pub struct CMoveEntityPosRot {
     pub x_rot: i8,
     /// Whether the entity is on the ground.
     pub on_ground: bool,
+}
+
+impl CMoveEntityPosRot {
+    /// Writes the body for a client on an older protocol version.
+    ///
+    /// Before 26.3 there is no `properties` field and no stepped path: the packet is the
+    /// entity id, one linear delta, the angle bytes and the on-ground flag.
+    ///
+    /// # Errors
+    /// - If the packet fails to write or the summed delta overflows.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl Write,
+        version: MinecraftVersion,
+    ) -> io::Result<()> {
+        if version.at_least(MinecraftVersion::V26_3) {
+            return self.write(writer);
+        }
+        VarInt(self.entity_id).write(writer)?;
+        let (dx, dy, dz) = self.delta.legacy_linear()?;
+        dx.write(writer)?;
+        dy.write(writer)?;
+        dz.write(writer)?;
+        self.y_rot.write(writer)?;
+        self.x_rot.write(writer)?;
+        self.on_ground.write(writer)
+    }
 }
 
 impl steel_utils::serial::WriteTo for CMoveEntityPosRot {
@@ -161,6 +246,15 @@ impl PackedEntityDelta {
     #[must_use]
     pub const fn from_raw(raw: i16) -> Self {
         Self(raw)
+    }
+
+    /// Creates a packed delta from a summed step offset, rejecting an `i16` overflow.
+    fn from_sum(sum: i32) -> io::Result<Self> {
+        i16::try_from(sum).map(Self).map_err(|_| {
+            io::Error::other(format!(
+                "summed movement delta {sum} does not fit the legacy i16 delta"
+            ))
+        })
     }
 
     /// Returns the raw protocol representation.
@@ -201,6 +295,7 @@ impl steel_utils::serial::WriteTo for PackedEntityDelta {
 /// angle bytes rather than a packed `properties` `VarInt`.
 #[derive(ClientPacket, WriteTo, Clone, Debug)]
 #[packet_id(Play = C_MOVE_ENTITY_ROT)]
+#[legacy_payload]
 pub struct CMoveEntityRot {
     #[write(as = VarInt)]
     pub entity_id: i32,
@@ -209,6 +304,29 @@ pub struct CMoveEntityRot {
     pub y_rot: i8,
     /// Pitch as angle byte
     pub x_rot: i8,
+}
+
+impl CMoveEntityRot {
+    /// Writes the body for a client on an older protocol version.
+    ///
+    /// 26.3 moved the on-ground flag ahead of the rotation bytes; every supported legacy
+    /// client still sends it last.
+    ///
+    /// # Errors
+    /// - If the packet fails to write.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl Write,
+        version: MinecraftVersion,
+    ) -> io::Result<()> {
+        if version.at_least(MinecraftVersion::V26_3) {
+            return self.write(writer);
+        }
+        VarInt(self.entity_id).write(writer)?;
+        self.y_rot.write(writer)?;
+        self.x_rot.write(writer)?;
+        self.on_ground.write(writer)
+    }
 }
 
 /// Converts degrees to a protocol angle byte (0-255 representing 0-360 degrees).
@@ -243,8 +361,6 @@ pub fn calc_delta(current: f64, previous: f64) -> Option<PackedEntityDelta> {
 
 #[cfg(test)]
 mod tests {
-    use steel_utils::serial::WriteTo as _;
-
     use super::*;
 
     // `entityId` VarInt, `properties` VarInt (on-ground flag in bit 0, step count in the
@@ -351,6 +467,166 @@ mod tests {
         packet.write(&mut buf).unwrap();
 
         assert_eq!(buf, vec![5, 1, 64, 192]);
+    }
+
+    // Before 26.3 the on-ground flag trails the angle bytes instead of leading them.
+    #[test]
+    fn rot_packet_moves_on_ground_last_before_26_3() {
+        let packet = CMoveEntityRot {
+            entity_id: 5,
+            on_ground: true,
+            y_rot: 64,
+            x_rot: -64,
+        };
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V26_2)
+            .expect("legacy rot payload should encode");
+        assert_eq!(legacy, vec![5, 64, 192, 1]);
+
+        let mut native = Vec::new();
+        packet.write(&mut native).unwrap();
+        assert_eq!(native, vec![5, 1, 64, 192]);
+
+        // 26.3 itself must stay byte-identical to the native layout.
+        let mut current = Vec::new();
+        packet
+            .write_payload_legacy(&mut current, MinecraftVersion::V26_3)
+            .expect("native rot payload should encode");
+        assert_eq!(current, native);
+    }
+
+    fn linear_pos() -> CMoveEntityPos {
+        CMoveEntityPos {
+            entity_id: 5,
+            delta: VecDelta::Linear {
+                dx: PackedEntityDelta::from_raw(1),
+                dy: PackedEntityDelta::from_raw(-1),
+                dz: PackedEntityDelta::from_raw(300),
+            },
+            on_ground: true,
+        }
+    }
+
+    // Pre-26.3 has no `properties` VarInt: the delta comes first, the flag last.
+    #[test]
+    fn pos_packet_before_26_3_has_no_properties_field() {
+        let packet = linear_pos();
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21)
+            .expect("legacy pos payload should encode");
+        assert_eq!(
+            legacy,
+            vec![
+                5, // entity id
+                0, 1, // dx = 1
+                0xFF, 0xFF, // dy = -1
+                1, 44, // dz = 300
+                1,  // on_ground
+            ]
+        );
+
+        // The native form packs the flag into a leading `properties` VarInt.
+        let mut native = Vec::new();
+        packet.write(&mut native).unwrap();
+        assert_eq!(native[1], 1, "native properties byte leads the delta");
+
+        // 26.3 must stay byte-identical to the native layout.
+        let mut current = Vec::new();
+        packet
+            .write_payload_legacy(&mut current, MinecraftVersion::V26_3)
+            .expect("native pos payload should encode");
+        assert_eq!(current, native);
+    }
+
+    // A stepped path does not exist before 26.3: its steps are summed into one linear delta.
+    #[test]
+    fn pos_packet_sums_a_stepped_path_before_26_3() {
+        let packet = CMoveEntityPos {
+            entity_id: 5,
+            delta: VecDelta::Stepped(vec![
+                DeltaStep {
+                    dx: PackedEntityDelta::from_raw(10),
+                    dy: PackedEntityDelta::from_raw(20),
+                    dz: PackedEntityDelta::from_raw(30),
+                    ticks: 1,
+                },
+                DeltaStep {
+                    dx: PackedEntityDelta::from_raw(5),
+                    dy: PackedEntityDelta::from_raw(-10),
+                    dz: PackedEntityDelta::from_raw(2),
+                    ticks: 2,
+                },
+            ]),
+            on_ground: false,
+        };
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V26_2)
+            .expect("stepped path should degrade to a linear delta");
+        assert_eq!(
+            legacy,
+            vec![
+                5, // entity id
+                0, 15, // dx = 10 + 5
+                0, 10, // dy = 20 - 10
+                0, 32, // dz = 30 + 2
+                0,  // on_ground
+            ]
+        );
+    }
+
+    // If the summed offset leaves the i16 range the packet cannot be expressed for an older
+    // client and must be dropped rather than sent with a wrapped offset.
+    #[test]
+    fn pos_packet_drops_a_stepped_path_that_overflows_i16() {
+        let packet = CMoveEntityPos {
+            entity_id: 5,
+            delta: VecDelta::Stepped(vec![
+                DeltaStep {
+                    dx: PackedEntityDelta::from_raw(30_000),
+                    dy: PackedEntityDelta::from_raw(0),
+                    dz: PackedEntityDelta::from_raw(0),
+                    ticks: 1,
+                },
+                DeltaStep {
+                    dx: PackedEntityDelta::from_raw(30_000),
+                    dy: PackedEntityDelta::from_raw(0),
+                    dz: PackedEntityDelta::from_raw(0),
+                    ticks: 2,
+                },
+            ]),
+            on_ground: true,
+        };
+        let mut legacy = Vec::new();
+        assert!(
+            packet
+                .write_payload_legacy(&mut legacy, MinecraftVersion::V26_2)
+                .is_err(),
+            "an unrepresentable summed delta must fail instead of wrapping"
+        );
+    }
+
+    // The position+rotation variant carries the same prefix and appends the angle bytes.
+    #[test]
+    fn pos_rot_packet_before_26_3_appends_angles_and_flag() {
+        let packet = CMoveEntityPosRot {
+            entity_id: 5,
+            delta: VecDelta::ZERO,
+            y_rot: 64,
+            x_rot: -64,
+            on_ground: true,
+        };
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21_9)
+            .expect("legacy pos_rot payload should encode");
+        assert_eq!(
+            legacy,
+            vec![5, 0, 0, 0, 0, 0, 0, 64, 192, 1],
+            "entity id, zero delta, yaw, pitch, on_ground"
+        );
     }
 
     #[test]

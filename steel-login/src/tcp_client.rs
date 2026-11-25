@@ -4,7 +4,6 @@
 //! until the connection is upgraded to play state.
 
 use std::{
-    cmp::Ordering,
     fmt::{self, Debug, Formatter},
     future::{Future, pending},
     io::Cursor,
@@ -21,6 +20,7 @@ use steel_core::player::{
     },
 };
 use steel_core::server::Server;
+use steel_protocol::version::MinecraftVersion;
 use steel_protocol::{
     packet_reader::TCPNetworkDecoder,
     packet_traits::{ClientPacket, CompressionInfo, EncodedPacket, ServerPacket},
@@ -204,6 +204,9 @@ pub struct JavaTcpClient {
     pub client_information: AsyncMutex<ClientInformation>,
     /// The current connection state of the client (e.g., Handshaking, Status, Play).
     pub protocol: Arc<AtomicCell<ConnectionProtocol>>,
+    /// The client's protocol version, captured from the handshake. Defaults to the server's
+    /// native version until a handshake resolves it; play packets are translated to it.
+    pub client_version: Arc<AtomicCell<MinecraftVersion>>,
     /// The client's IP address.
     pub address: SocketAddr,
     /// A token to cancel the client's operations. Called when the connection is closed.
@@ -287,6 +290,7 @@ impl JavaTcpClient {
             client_information: AsyncMutex::new(ClientInformation::default()),
             address,
             protocol: Arc::new(AtomicCell::new(ConnectionProtocol::Handshake)),
+            client_version: Arc::new(AtomicCell::new(MinecraftVersion::CURRENT)),
             cancel_token,
 
             outgoing_queue,
@@ -700,10 +704,21 @@ impl JavaTcpClient {
                     return Ok(());
                 }
                 if intent == ConnectionProtocol::Status {
+                    // The status payload is version-dependent (Слой E); remember the ping's
+                    // version even when the client will not be admitted to login.
+                    if let Some(version) = MinecraftVersion::from_protocol(packet.protocol_version)
+                    {
+                        self.client_version.store(version);
+                    }
                     self.protocol.store(intent);
                 } else {
-                    let reason = match packet.protocol_version.cmp(&CURRENT_MC_PROTOCOL) {
-                        Ordering::Equal => {
+                    // A known-but-untranslated version must not be admitted: it would receive
+                    // current-version packets it cannot parse.
+                    let client_version = MinecraftVersion::from_protocol(packet.protocol_version)
+                        .filter(|version| version.is_translatable());
+                    let reason = match client_version {
+                        Some(version) => {
+                            self.client_version.store(version);
                             let tick_manager = self.server.tick_rate_manager.read();
                             self.login_deadline
                                 .store(Some(LoginDeadline::from_start_tick(
@@ -712,11 +727,13 @@ impl JavaTcpClient {
                             self.protocol.store(intent);
                             return Ok(());
                         }
-                        Ordering::Less => TextComponent::translated(
-                            translations::MULTIPLAYER_DISCONNECT_OUTDATED_CLIENT
-                                .message([MC_VERSION]),
-                        ),
-                        Ordering::Greater => TextComponent::translated(
+                        None if packet.protocol_version < CURRENT_MC_PROTOCOL => {
+                            TextComponent::translated(
+                                translations::MULTIPLAYER_DISCONNECT_OUTDATED_CLIENT
+                                    .message([MC_VERSION]),
+                            )
+                        }
+                        None => TextComponent::translated(
                             translations::MULTIPLAYER_DISCONNECT_INCOMPATIBLE.message([MC_VERSION]),
                         ),
                     };

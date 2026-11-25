@@ -19,6 +19,13 @@ pub fn client_packet_derive(input: TokenStream) -> TokenStream {
         "ClientPacket derive macro requires at least one #[packet_id(...)] attribute"
     );
 
+    // `#[legacy_payload]` opts this packet into a version-specific body, written by the
+    // inherent `write_payload_legacy` method instead of the native `WriteTo` impl.
+    let legacy_payload = input
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("legacy_payload"));
+
     let mut match_arms = Vec::new();
 
     for attr in attrs {
@@ -47,6 +54,21 @@ pub fn client_packet_derive(input: TokenStream) -> TokenStream {
 
     let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
 
+    let write_payload = if legacy_payload {
+        quote! {
+            fn write_payload(
+                &self,
+                writer: &mut impl ::std::io::Write,
+                version: crate::version::MinecraftVersion,
+            ) -> ::std::result::Result<(), crate::utils::PacketError> {
+                Self::write_payload_legacy(self, writer, version)
+                    .map_err(crate::utils::PacketError::from)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #[automatically_derived]
         impl #impl_generics crate::packet_traits::ClientPacket for #name #ty_generics {
@@ -56,6 +78,8 @@ pub fn client_packet_derive(input: TokenStream) -> TokenStream {
                     _ => None,
                 }
             }
+
+            #write_payload
         }
     };
 
@@ -67,23 +91,30 @@ pub fn server_packet_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
 
-    //let attr = input
-    //    .attrs
-    //    .iter()
-    //    .find(|a| a.path().is_ident("packet_id"))
-    //    .expect("ServerPacket requires a #[packet_id(...)] attribute");
+    // `#[legacy_payload]` opts this packet into reading a version-specific body through the
+    // inherent `read_payload_legacy` method instead of its native `ReadFrom` impl.
+    let legacy_payload = input
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("legacy_payload"));
 
-    //let id_expr: Expr = if let Meta::List(meta) = &attr.meta {
-    //    syn::parse2(meta.tokens.clone())
-    //        .expect("Failed to parse packet_id content as expression")
-    //} else {
-    //    panic!("`packet_id` must be used as #[packet_id(...)]");
-    //};
+    let read_packet_for = if legacy_payload {
+        quote! {
+            fn read_packet_for(
+                data: &mut ::std::io::Cursor<&[u8]>,
+                version: crate::version::MinecraftVersion,
+            ) -> ::std::result::Result<Self, crate::utils::PacketError> {
+                Self::read_payload_legacy(data, version).map_err(crate::utils::PacketError::from)
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let expanded = quote! {
         #[automatically_derived]
         impl crate::packet_traits::ServerPacket for #name {
-    //        const ID: i32 = #id_expr as i32;
+            #read_packet_for
         }
     };
 

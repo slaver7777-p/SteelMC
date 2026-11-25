@@ -4,6 +4,9 @@ use rustc_hash::FxHashMap;
 use steel_macros::ServerPacket;
 use steel_utils::{codec::VarInt, serial::ReadFrom};
 
+use crate::legacy::read_container_id_legacy;
+use crate::version::MinecraftVersion;
+
 /// The type of click action performed on a container slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -113,6 +116,7 @@ impl ReadFrom for HashedStack {
 
 /// Serverbound packet sent when a player clicks in a container.
 #[derive(ServerPacket, Debug, Clone)]
+#[legacy_payload]
 pub struct SContainerClick {
     pub container_id: i32,
     pub state_id: i32,
@@ -126,6 +130,25 @@ pub struct SContainerClick {
 impl ReadFrom for SContainerClick {
     fn read(data: &mut Cursor<&[u8]>) -> Result<Self> {
         let container_id = VarInt::read(data)?.0;
+        Self::read_after_container_id(data, container_id)
+    }
+}
+
+impl SContainerClick {
+    /// Reads the body, accepting `container_id` as a byte from clients before 1.21.2.
+    ///
+    /// # Errors
+    /// - If the packet is malformed.
+    pub fn read_payload_legacy(
+        data: &mut Cursor<&[u8]>,
+        version: MinecraftVersion,
+    ) -> Result<Self> {
+        let container_id = read_container_id_legacy(data, version)?;
+        Self::read_after_container_id(data, container_id)
+    }
+
+    /// Reads every field following the container id, which is identical across versions.
+    fn read_after_container_id(data: &mut Cursor<&[u8]>, container_id: i32) -> Result<Self> {
         let state_id = VarInt::read(data)?.0;
         let slot_num = i16::read(data)?;
         let button_num = i8::read(data)?;

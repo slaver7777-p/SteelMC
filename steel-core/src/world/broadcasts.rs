@@ -3,7 +3,9 @@ use super::{
     EntityMovementSyncPacket, NetworkConnection, Player, PlayerChunkView, World,
 };
 use crate::player::chat::OutgoingChatMessage;
+use steel_protocol::packet_traits::VersionCache;
 use steel_protocol::packets::game::ChatTypeBound;
+use steel_protocol::version::MinecraftVersion;
 
 impl World {
     /// Broadcasts a chat message (signed or not) to all players
@@ -20,23 +22,24 @@ impl World {
     }
 
     /// Broadcasts a packet to all players in the world.
-    pub fn broadcast_to_all<P: ClientPacket>(&self, packet: P) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
-        self.broadcast_to_all_encoded(encoded);
+    pub fn broadcast_to_all<P: ClientPacket + Clone>(&self, packet: P) {
+        let mut cache = VersionCache::new();
+        self.players.iter_players(|_, player| {
+            self.send_play_to(player, packet.clone(), &mut cache);
+            true
+        });
     }
 
     /// Broadcasts a packet to all players in the world except one (identified by entity ID).
-    pub fn broadcast_to_all_except<P: ClientPacket>(&self, packet: P, exclude: i32) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
-        self.broadcast_to_all_encoded_except(encoded, exclude);
+    pub fn broadcast_to_all_except<P: ClientPacket + Clone>(&self, packet: P, exclude: i32) {
+        let mut cache = VersionCache::new();
+        self.players.iter_players(|_, player| {
+            if player.id() == exclude {
+                return true;
+            }
+            self.send_play_to(player, packet.clone(), &mut cache);
+            true
+        });
     }
 
     /// Broadcasts a packet to all players in the world.
@@ -44,32 +47,7 @@ impl World {
     /// This method handles encoding the packets produced from the function passed.
     pub fn broadcast_to_all_with<P: ClientPacket, F: Fn(&Player) -> P>(&self, packet: F) {
         self.players.iter_players(|_, player| {
-            let Ok(encoded) = EncodedPacket::from_bare(
-                packet(player),
-                self.compression,
-                ConnectionProtocol::Play,
-            ) else {
-                return false;
-            };
-            player.connection.send_encoded(encoded);
-            true
-        });
-    }
-
-    /// Broadcasts an already-encoded packet to all players in the world.
-    pub fn broadcast_to_all_encoded(&self, packet: EncodedPacket) {
-        self.players.iter_players(|_, player| {
-            player.connection.send_encoded(packet.clone());
-            true
-        });
-    }
-
-    /// Broadcasts an already-encoded packet to all players except one.
-    pub fn broadcast_to_all_encoded_except(&self, packet: EncodedPacket, exclude: i32) {
-        self.players.iter_players(|_, player| {
-            if player.id() != exclude {
-                player.connection.send_encoded(packet.clone());
-            }
+            player.send_packet(packet(player));
             true
         });
     }
@@ -91,37 +69,22 @@ impl World {
     /// Broadcasts a packet to all players tracking the given chunk.
     ///
     /// This method handles encoding the packet internally, avoiding boilerplate at call sites.
-    /// If encoding fails, the broadcast is silently skipped.
-    pub fn broadcast_to_nearby<P: ClientPacket>(
+    /// A legacy tracker receives the packet translated to its version; if encoding fails for a
+    /// version, that recipient is skipped while others still receive it.
+    pub fn broadcast_to_nearby<P: ClientPacket + Clone>(
         &self,
         chunk: ChunkPos,
         packet: P,
         exclude: Option<i32>,
     ) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
-        self.broadcast_to_nearby_encoded(chunk, encoded, exclude);
-    }
-
-    /// Broadcasts an already-encoded packet to all players tracking the given chunk.
-    ///
-    /// Use this when you have a pre-encoded packet to avoid re-encoding.
-    pub fn broadcast_to_nearby_encoded(
-        &self,
-        chunk: ChunkPos,
-        packet: EncodedPacket,
-        exclude: Option<i32>,
-    ) {
         let tracking_players = self.get_packet_tracking_players(chunk);
+        let mut cache = VersionCache::new();
         for entity_id in tracking_players {
             if Some(entity_id) == exclude {
                 continue;
             }
             if let Some(player) = self.players.get_by_entity_id(entity_id) {
-                player.connection.send_encoded(packet.clone());
+                self.send_play_to(&player, packet.clone(), &mut cache);
             }
         }
     }
@@ -192,39 +155,37 @@ impl World {
     }
 
     /// Broadcasts a packet to players currently tracking an entity.
-    pub fn broadcast_to_entity_trackers<P: ClientPacket>(
+    pub fn broadcast_to_entity_trackers<P: ClientPacket + Clone>(
         &self,
         entity_id: i32,
         packet: P,
         exclude: Option<i32>,
     ) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
-        self.broadcast_to_entity_trackers_encoded(entity_id, encoded, exclude);
+        let mut cache = VersionCache::new();
+        for player_id in self.entity_tracker.tracking_player_ids(entity_id) {
+            if Some(player_id) == exclude {
+                continue;
+            }
+            if let Some(player) = self.players.get_by_entity_id(player_id) {
+                self.send_play_to(&player, packet.clone(), &mut cache);
+            }
+        }
     }
 
     /// Broadcasts a packet to players tracking an entity, excluding several players.
-    pub fn broadcast_to_entity_trackers_except_many<P: ClientPacket>(
+    pub fn broadcast_to_entity_trackers_except_many<P: ClientPacket + Clone>(
         &self,
         entity_id: i32,
         packet: P,
         excluded_player_ids: &[i32],
     ) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
-
+        let mut cache = VersionCache::new();
         for player_id in self.entity_tracker.tracking_player_ids(entity_id) {
             if excluded_player_ids.contains(&player_id) {
                 continue;
             }
             if let Some(player) = self.players.get_by_entity_id(player_id) {
-                player.connection.send_encoded(encoded.clone());
+                self.send_play_to(&player, packet.clone(), &mut cache);
             }
         }
     }
@@ -236,63 +197,81 @@ impl World {
         packet: EntityMovementSyncPacket,
         exclude: Option<i32>,
     ) {
-        let Some(encoded) = self.encode_movement_sync_packet(packet) else {
-            return;
-        };
+        let mut cache = VersionCache::new();
         for player_id in self.entity_tracker.tracking_player_ids(entity_id) {
             if Some(player_id) == exclude {
                 continue;
             }
             if let Some(player) = self.players.get_by_entity_id(player_id) {
-                encoded.send_to(&player);
+                let version = player.connection.legacy_version();
+                let encoded = cache.get_or_insert_with(version, || {
+                    self.encode_movement_sync_for(packet.clone(), version)
+                });
+                if let Some(encoded) = encoded {
+                    encoded.send_to(&player);
+                }
             }
         }
     }
 
-    /// Broadcasts an already-encoded packet to players currently tracking an entity.
-    pub fn broadcast_to_entity_trackers_encoded(
+    /// Encodes `packet` for the client's version and sends it, caching per version.
+    ///
+    /// A recipient whose version has no id for this packet is skipped; others still receive it.
+    pub(crate) fn send_play_to<P: ClientPacket>(
         &self,
-        entity_id: i32,
-        packet: EncodedPacket,
-        exclude: Option<i32>,
+        player: &Player,
+        packet: P,
+        cache: &mut VersionCache<EncodedPacket>,
     ) {
-        for player_id in self.entity_tracker.tracking_player_ids(entity_id) {
-            if Some(player_id) == exclude {
-                continue;
-            }
-            if let Some(player) = self.players.get_by_entity_id(player_id) {
-                player.connection.send_encoded(packet.clone());
-            }
+        let version = player.connection.legacy_version();
+        let encoded = cache.get_or_insert_with(version, || self.encode_play_for(packet, version));
+        if let Some(encoded) = encoded {
+            player.connection.send_encoded(encoded);
         }
     }
 
-    pub(super) fn encode_movement_sync_packet(
+    /// Encodes a play packet for `version`, or `None` when that version cannot receive it.
+    fn encode_play_for<P: ClientPacket>(
+        &self,
+        packet: P,
+        version: Option<MinecraftVersion>,
+    ) -> Option<EncodedPacket> {
+        EncodedPacket::from_bare_optional(
+            packet,
+            self.compression,
+            ConnectionProtocol::Play,
+            version,
+        )
+    }
+
+    /// Encodes a movement sync packet for one client version.
+    pub(super) fn encode_movement_sync_for(
         &self,
         packet: EntityMovementSyncPacket,
+        version: Option<MinecraftVersion>,
     ) -> Option<EncodedMovementSync> {
         let encoded = match packet {
-            EntityMovementSyncPacket::Position(packet) => self.encode_play(packet),
-            EntityMovementSyncPacket::PositionRotation(packet) => self.encode_play(packet),
-            EntityMovementSyncPacket::Rotation(packet) => self.encode_play(packet),
-            EntityMovementSyncPacket::HeadRotation(packet) => self.encode_play(packet),
-            EntityMovementSyncPacket::PositionSync(packet) => self.encode_play(packet),
-            EntityMovementSyncPacket::Velocity(packet) => self.encode_play(packet),
+            EntityMovementSyncPacket::Position(packet) => self.encode_play_for(packet, version),
+            EntityMovementSyncPacket::PositionRotation(packet) => {
+                self.encode_play_for(packet, version)
+            }
+            EntityMovementSyncPacket::Rotation(packet) => self.encode_play_for(packet, version),
+            EntityMovementSyncPacket::HeadRotation(packet) => self.encode_play_for(packet, version),
+            EntityMovementSyncPacket::PositionSync(packet) => self.encode_play_for(packet, version),
+            EntityMovementSyncPacket::Velocity(packet) => self.encode_play_for(packet, version),
             EntityMovementSyncPacket::ProjectileVelocity(motion, power) => {
                 return Some(EncodedMovementSync::Bundle(vec![
-                    self.encode_play(motion)?,
-                    self.encode_play(power)?,
+                    self.encode_play_for(motion, version)?,
+                    self.encode_play_for(power, version)?,
                 ]));
             }
         };
         encoded.map(EncodedMovementSync::Single)
     }
-
-    fn encode_play<P: ClientPacket>(&self, packet: P) -> Option<EncodedPacket> {
-        EncodedPacket::from_bare(packet, self.compression, ConnectionProtocol::Play).ok()
-    }
 }
 
 /// An encoded movement sync, sent alone or as a client bundle.
+#[derive(Clone)]
 pub(super) enum EncodedMovementSync {
     Single(EncodedPacket),
     Bundle(Vec<EncodedPacket>),

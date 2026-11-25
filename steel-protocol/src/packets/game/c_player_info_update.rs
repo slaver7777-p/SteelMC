@@ -2,12 +2,13 @@ use steel_macros::ClientPacket;
 use steel_registry::GameProfile;
 use steel_registry::packets::play::C_PLAYER_INFO_UPDATE;
 use steel_utils::codec::VarInt;
-use steel_utils::serial::PrefixedWrite;
+use steel_utils::serial::{PrefixedWrite, WriteTo};
 use text_components::TextComponent;
 use uuid::Uuid;
 
 // Import RemoteChatSessionData for chat session transmission
 use super::ProtocolRemoteChatSessionData;
+use crate::version::MinecraftVersion;
 
 /// Actions for the player info update packet.
 /// These match the vanilla Java ClientboundPlayerInfoUpdatePacket.Action enum.
@@ -153,6 +154,7 @@ impl PlayerInfoEntry {
 
 #[derive(ClientPacket, Debug, Clone)]
 #[packet_id(Play = C_PLAYER_INFO_UPDATE)]
+#[legacy_payload]
 pub struct CPlayerInfoUpdate {
     pub actions: u8, // Bitmask of PlayerInfoAction
     pub entries: Vec<PlayerInfoEntry>,
@@ -272,13 +274,23 @@ impl CPlayerInfoUpdate {
 
 impl steel_utils::serial::WriteTo for CPlayerInfoUpdate {
     fn write(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
-        self.actions.write(writer)?;
+        self.write_actions(writer, self.actions)
+    }
+}
+
+impl CPlayerInfoUpdate {
+    /// Writes the packet body with an explicit action bitmask.
+    ///
+    /// Older clients do not know every action bit, so the legacy adapter masks the bits it
+    /// cannot represent and reuses this writer with the reduced mask.
+    fn write_actions(&self, writer: &mut impl std::io::Write, actions: u8) -> std::io::Result<()> {
+        actions.write(writer)?;
         VarInt(self.entries.len() as i32).write(writer)?;
 
         for entry in &self.entries {
             entry.target.uuid().write(writer)?;
 
-            if self.actions & (PlayerInfoAction::AddPlayer as u8) != 0 {
+            if actions & (PlayerInfoAction::AddPlayer as u8) != 0 {
                 let PlayerInfoTarget::Profile(profile) = &entry.target else {
                     return Err(std::io::Error::other(
                         "AddPlayer entry requires a game profile",
@@ -288,7 +300,7 @@ impl steel_utils::serial::WriteTo for CPlayerInfoUpdate {
                 profile.write_properties(writer)?;
             }
 
-            if self.actions & (PlayerInfoAction::InitializeChat as u8) != 0 {
+            if actions & (PlayerInfoAction::InitializeChat as u8) != 0 {
                 // Write nullable chat session data
                 if let Some(session_data) = &entry.chat_session {
                     true.write(writer)?;
@@ -298,22 +310,22 @@ impl steel_utils::serial::WriteTo for CPlayerInfoUpdate {
                 }
             }
 
-            if self.actions & (PlayerInfoAction::UpdateGameMode as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateGameMode as u8) != 0 {
                 let game_mode = entry.game_mode.unwrap_or(VarInt(0));
                 game_mode.write(writer)?;
             }
 
-            if self.actions & (PlayerInfoAction::UpdateListed as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateListed as u8) != 0 {
                 let listed = entry.listed.unwrap_or(true);
                 listed.write(writer)?;
             }
 
-            if self.actions & (PlayerInfoAction::UpdateLatency as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateLatency as u8) != 0 {
                 let latency = entry.latency.unwrap_or(VarInt(0));
                 latency.write(writer)?;
             }
 
-            if self.actions & (PlayerInfoAction::UpdateDisplayName as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateDisplayName as u8) != 0 {
                 // Write as optional TextComponent (boolean + component if present)
                 match &entry.display_name {
                     Some(PlayerDisplayName::Custom(display_name)) => {
@@ -326,18 +338,41 @@ impl steel_utils::serial::WriteTo for CPlayerInfoUpdate {
                 }
             }
 
-            if self.actions & (PlayerInfoAction::UpdateListOrder as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateListOrder as u8) != 0 {
                 let list_order = entry.list_order.unwrap_or(VarInt(0));
                 list_order.write(writer)?;
             }
 
-            if self.actions & (PlayerInfoAction::UpdateHat as u8) != 0 {
+            if actions & (PlayerInfoAction::UpdateHat as u8) != 0 {
                 let show_hat = entry.show_hat.unwrap_or(true);
                 show_hat.write(writer)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Writes the body for a client on an older protocol version.
+    ///
+    /// The list-order action was added in 1.21.2 and the hat action in 1.21.4. Older
+    /// clients cannot decode those bits, so they are cleared from the mask and their
+    /// payloads are omitted, exactly like vanilla does for clients that predate them.
+    ///
+    /// # Errors
+    /// - If the packet fails to write.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl std::io::Write,
+        version: MinecraftVersion,
+    ) -> std::io::Result<()> {
+        let mut actions = self.actions;
+        if !version.at_least(MinecraftVersion::V1_21_2) {
+            actions &= !(PlayerInfoAction::UpdateListOrder as u8);
+        }
+        if !version.at_least(MinecraftVersion::V1_21_4) {
+            actions &= !(PlayerInfoAction::UpdateHat as u8);
+        }
+        self.write_actions(writer, actions)
     }
 }
 
@@ -354,6 +389,7 @@ mod tests {
     use steel_registry::{GameProfile, ProfileProperty};
 
     use super::{CPlayerInfoUpdate, PLAYER_INFO_INIT_ACTIONS};
+    use crate::version::MinecraftVersion;
 
     #[test]
     fn initial_player_info_preserves_signed_texture_property() {
@@ -412,6 +448,84 @@ mod tests {
         assert_eq!(
             String::read_prefixed::<VarInt>(&mut cursor).expect("signature should decode"),
             "texture-signature"
+        );
+    }
+
+    fn encoded_actions(packet: &CPlayerInfoUpdate, version: MinecraftVersion) -> u8 {
+        let mut bytes = Vec::new();
+        packet
+            .write_payload_legacy(&mut bytes, version)
+            .expect("legacy payload should encode");
+        bytes[0]
+    }
+
+    #[test]
+    fn legacy_payload_keeps_actions_supported_by_the_client() {
+        let packet = CPlayerInfoUpdate {
+            actions: PLAYER_INFO_INIT_ACTIONS,
+            entries: vec![],
+        };
+
+        // The native mask is written as-is from 1.21.4 on.
+        for version in [
+            MinecraftVersion::V1_21_4,
+            MinecraftVersion::V1_21_9,
+            MinecraftVersion::V26_3,
+        ] {
+            assert_eq!(encoded_actions(&packet, version), PLAYER_INFO_INIT_ACTIONS);
+        }
+    }
+
+    #[test]
+    fn legacy_payload_drops_hat_before_1_21_4() {
+        let packet = CPlayerInfoUpdate {
+            actions: PLAYER_INFO_INIT_ACTIONS,
+            entries: vec![],
+        };
+
+        let actions = encoded_actions(&packet, MinecraftVersion::V1_21_2);
+        assert_eq!(actions & 0x80, 0, "hat action is unknown before 1.21.4");
+        assert_eq!(
+            actions,
+            PLAYER_INFO_INIT_ACTIONS & !0x80,
+            "every other action is kept"
+        );
+    }
+
+    #[test]
+    fn legacy_payload_drops_hat_and_list_order_before_1_21_2() {
+        let packet = CPlayerInfoUpdate {
+            actions: PLAYER_INFO_INIT_ACTIONS,
+            entries: vec![],
+        };
+
+        let actions = encoded_actions(&packet, MinecraftVersion::V1_21);
+        assert_eq!(actions & 0xC0, 0, "hat and list order are unknown");
+        assert_eq!(actions, PLAYER_INFO_INIT_ACTIONS & !0xC0);
+    }
+
+    #[test]
+    fn legacy_payload_omits_masked_action_payloads() {
+        let uuid = Uuid::from_u128(7);
+        let profile = GameProfile::new(uuid, "Ordered".to_owned(), vec![]).expect("valid profile");
+        let entry = CPlayerInfoUpdate::create_player_initializing_entry(profile, 0, 0, None, true)
+            .with_list_order(5);
+        let packet = CPlayerInfoUpdate {
+            actions: PLAYER_INFO_INIT_ACTIONS,
+            entries: vec![entry],
+        };
+
+        let mut native = Vec::new();
+        packet.write(&mut native).expect("native encode");
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21)
+            .expect("legacy encode");
+
+        assert_eq!(
+            legacy.len(),
+            native.len() - 2,
+            "list order (1 byte) and hat (1 byte) payloads are omitted"
         );
     }
 }

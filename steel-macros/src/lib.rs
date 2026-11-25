@@ -76,15 +76,23 @@ pub fn write_to_derive(input: TokenStream) -> TokenStream {
 
 /// Derives the `ClientPacket` trait for a struct.
 ///
+/// Add `#[legacy_payload]` when the packet's body differs on older supported versions: the
+/// derive then routes the version-aware write through the struct's inherent
+/// `write_payload_legacy` method instead of its native `WriteTo` impl.
+///
 /// # Panics
 /// - If the `packet_id` attribute is missing or malformed.
-#[proc_macro_derive(ClientPacket, attributes(packet_id))]
+#[proc_macro_derive(ClientPacket, attributes(packet_id, legacy_payload))]
 pub fn client_packet_derive(input: TokenStream) -> TokenStream {
     packet::client_packet_derive(input)
 }
 
 /// Derives the `ServerPacket` trait for a struct.
-#[proc_macro_derive(ServerPacket, attributes(packet_id))]
+///
+/// Add `#[legacy_payload]` when the packet's body differs from clients on older supported
+/// versions: the derive then routes the version-aware read through the struct's inherent
+/// `read_payload_legacy` method instead of its native `ReadFrom` impl.
+#[proc_macro_derive(ServerPacket, attributes(packet_id, legacy_payload))]
 pub fn server_packet_derive(input: TokenStream) -> TokenStream {
     packet::server_packet_derive(input)
 }

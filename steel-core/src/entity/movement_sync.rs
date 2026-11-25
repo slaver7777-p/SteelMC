@@ -231,6 +231,7 @@ impl EntityMovementSyncPackets {
 pub struct EntityPositionSyncSnapshot {
     entity_id: i32,
     position: DVec3,
+    velocity: DVec3,
     rotation: (f32, f32),
     on_ground: bool,
 }
@@ -241,12 +242,14 @@ impl EntityPositionSyncSnapshot {
     pub const fn new(
         entity_id: i32,
         position: DVec3,
+        velocity: DVec3,
         rotation: (f32, f32),
         on_ground: bool,
     ) -> Self {
         Self {
             entity_id,
             position,
+            velocity,
             rotation,
             on_ground,
         }
@@ -260,6 +263,7 @@ impl EntityPositionSyncSnapshot {
         CEntityPositionSync {
             entity_id: self.entity_id,
             path,
+            velocity: self.velocity,
             y_rot: self.rotation.0,
             x_rot: self.rotation.1,
             on_ground: self.on_ground,
@@ -888,6 +892,7 @@ impl ServerEntityMovementSyncState {
         let snapshot = EntityPositionSyncSnapshot::new(
             update.entity_id,
             update.position,
+            update.velocity,
             update.body_rotation,
             update.on_ground,
         );
@@ -995,6 +1000,7 @@ impl EntityMovementSyncState {
             let snapshot = EntityPositionSyncSnapshot::new(
                 update.entity_id,
                 update.position,
+                update.velocity,
                 update.body_rotation,
                 update.on_ground,
             );
@@ -1572,6 +1578,7 @@ mod tests {
         let packet = decision.into_position_packet(EntityPositionSyncSnapshot::new(
             12,
             position,
+            DVec3::ZERO,
             (90.0, 45.0),
             true,
         ));
@@ -1603,6 +1610,7 @@ mod tests {
         let packet = decision.into_position_rot_packet(EntityPositionSyncSnapshot::new(
             12,
             position,
+            DVec3::ZERO,
             (90.0, 45.0),
             true,
         ));
@@ -1626,8 +1634,13 @@ mod tests {
 
     #[test]
     fn sync_decision_builds_full_position_sync_packet() {
-        let snapshot =
-            EntityPositionSyncSnapshot::new(12, DVec3::new(10.0, 20.0, 30.0), (90.0, 45.0), true);
+        let snapshot = EntityPositionSyncSnapshot::new(
+            12,
+            DVec3::new(10.0, 20.0, 30.0),
+            DVec3::ZERO,
+            (90.0, 45.0),
+            true,
+        );
 
         let packet = EntityPositionSyncDecision::Full.into_position_packet(snapshot);
 

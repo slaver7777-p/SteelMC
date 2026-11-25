@@ -86,6 +86,16 @@ impl RawPacket {
     pub fn payload(&self) -> &[u8] {
         &self.buffer[self.payload_start as usize..]
     }
+
+    /// Replaces the packet id, keeping the payload untouched.
+    ///
+    /// Used to translate a legacy client's id into the server's numbering; the payload
+    /// offset is preserved so no bytes are copied.
+    #[must_use]
+    pub const fn with_id(mut self, id: i32) -> Self {
+        self.id = id;
+        self
+    }
 }
 
 /// An error that can occur when handling packets.
@@ -116,8 +126,11 @@ pub enum PacketError {
     /// The packet is uncompressed but greater than the threshold.
     NotCompressed,
     #[error("failed to decrypt packet: {0}")]
-    /// Failed to decrypt the packet.
+    /// Failed to decrypt packet.
     DecryptionFailed(String),
+    #[error("packet id {0} has no counterpart in the client's protocol version")]
+    /// The client's protocol version does not have this packet, so it must be dropped.
+    LegacyPacketUnsupported(i32),
     #[error("failed to encrypt packet: {0}")]
     /// Failed to encrypt the packet.
     EncryptionFailed(String),

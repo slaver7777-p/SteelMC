@@ -7,6 +7,7 @@ use std::{
 };
 
 use steel_protocol::packet_traits::{CompressionInfo, EncodedPacket};
+use steel_protocol::version::MinecraftVersion;
 use steel_utils::{
     locks::{AsyncMutex, SyncMutex},
     translations,
@@ -45,6 +46,7 @@ fn java_test_player(
         Arc::clone(&network_writer),
         1,
         Arc::clone(&session),
+        MinecraftVersion::CURRENT,
     )));
     let player = Arc::new(Player::new(
         GameProfile::new(uuid, "TestPlayer".to_owned(), Vec::new()).expect("valid test profile"),

@@ -17,7 +17,8 @@ use steel_protocol::packets::common::{
     ChatVisibility, HumanoidArm, ParticleStatus, SClientInformation,
 };
 use steel_protocol::packets::game::CPlayerInfoUpdate;
-use steel_protocol::utils::ConnectionProtocol;
+use steel_protocol::utils::{ConnectionProtocol, PacketError};
+use steel_protocol::version::MinecraftVersion;
 use text_components::TextComponent;
 
 use crate::player::Player;
@@ -80,6 +81,14 @@ pub trait NetworkConnection: Send + Sync {
     /// Returns `None` if compression is disabled (e.g., for test connections).
     fn compression(&self) -> Option<CompressionInfo>;
 
+    /// The client's protocol version when packets must be translated, else `None`.
+    ///
+    /// Senders encode with this so a legacy client receives its own packet ids and payload
+    /// layout. Connections that do not translate (tests, other backends) return `None`.
+    fn legacy_version(&self) -> Option<MinecraftVersion> {
+        None
+    }
+
     /// Sends a pre-encoded packet.
     ///
     /// This is the object-safe method that accepts already-encoded packets.
@@ -126,6 +135,10 @@ impl NetworkConnection for Box<dyn NetworkConnection> {
         (**self).compression()
     }
 
+    fn legacy_version(&self) -> Option<MinecraftVersion> {
+        (**self).legacy_version()
+    }
+
     fn send_encoded(&self, packet: EncodedPacket) {
         (**self).send_encoded(packet);
     }
@@ -165,11 +178,22 @@ impl Player {
     ///
     /// Panics if the packet fails to encode.
     pub fn send_packet<P: ClientPacket>(&self, packet: P) {
-        let encoded = EncodedPacket::from_bare(
-            packet,
-            self.connection.compression(),
-            ConnectionProtocol::Play,
-        )
+        let encoded = match self.connection.legacy_version() {
+            None => EncodedPacket::from_bare(
+                packet,
+                self.connection.compression(),
+                ConnectionProtocol::Play,
+            ),
+            Some(version) => match EncodedPacket::from_bare_for(
+                packet,
+                self.connection.compression(),
+                ConnectionProtocol::Play,
+                version,
+            ) {
+                Err(PacketError::LegacyPacketUnsupported(_)) => return,
+                result => result,
+            },
+        }
         .expect("Failed to encode packet");
         self.connection.send_encoded(encoded);
     }
@@ -183,7 +207,10 @@ impl Player {
     where
         F: FnOnce(&mut BundleBuilder),
     {
-        let mut builder = BundleBuilder::new(self.connection.compression());
+        let mut builder = BundleBuilder::new(
+            self.connection.compression(),
+            self.connection.legacy_version(),
+        );
         f(&mut builder);
         let packets = builder.into_packets();
         if !packets.is_empty() {

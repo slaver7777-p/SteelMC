@@ -127,6 +127,7 @@ impl JavaTcpClient {
             Arc::clone(&self.network_writer),
             self.id,
             Arc::clone(&session),
+            self.client_version.load(),
         );
         let connection = Arc::new(PlayerConnection::Java(java_connection));
         let player = Arc::new(Player::new(

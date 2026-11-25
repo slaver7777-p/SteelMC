@@ -105,6 +105,46 @@ impl ParticleData {
         self.particle_type
     }
 
+    /// Returns this particle's registry id for the network encoding.
+    ///
+    /// # Errors
+    /// - If the particle type is not the registered value for its key.
+    /// - If the registry id does not fit in an `i32`.
+    pub fn network_id(&self) -> Result<i32> {
+        let (id, _) = REGISTRY
+            .particle_types
+            .registered_entry_with_id(self.particle_type)
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "Particle type is not the registered value for key: {}",
+                    self.particle_type.key
+                ))
+            })?;
+        i32::try_from(id).map_err(|_| Error::other(format!("Particle type id out of range: {id}")))
+    }
+
+    /// Writes only the registry id as a `VarInt`.
+    ///
+    /// Packets whose wire layout separates the id from the options payload (for example
+    /// pre-26.3 level particles and explosions) use this instead of [`WriteTo::write`].
+    ///
+    /// # Errors
+    /// - If [`Self::network_id`] fails.
+    /// - If the id fails to write.
+    pub fn write_network_id(&self, writer: &mut impl Write) -> Result<()> {
+        VarInt(self.network_id()?).write(writer)
+    }
+
+    /// Writes only the particle options payload, without the registry id.
+    ///
+    /// # Errors
+    /// - If the options fail to write.
+    pub fn write_network_options(&self, writer: &mut impl Write) -> Result<()> {
+        let mut payload = Vec::new();
+        (self.particle_type.network_writer)(self.options.as_ref(), &mut payload)?;
+        writer.write_all(&payload)
+    }
+
     #[must_use]
     pub fn downcast_ref<T: DowncastType>(&self) -> Option<&T> {
         self.options.downcast_ref::<T>()
@@ -139,22 +179,8 @@ impl PartialEq for ParticleData {
 
 impl WriteTo for ParticleData {
     fn write(&self, writer: &mut impl Write) -> Result<()> {
-        let (id, particle_type) = REGISTRY
-            .particle_types
-            .registered_entry_with_id(self.particle_type)
-            .ok_or_else(|| {
-                Error::other(format!(
-                    "Particle type is not the registered value for key: {}",
-                    self.particle_type.key
-                ))
-            })?;
-        let id = i32::try_from(id)
-            .map_err(|_| Error::other(format!("Particle type id out of range: {id}")))?;
-        VarInt(id).write(writer)?;
-
-        let mut payload = Vec::new();
-        (particle_type.network_writer)(self.options.as_ref(), &mut payload)?;
-        writer.write_all(&payload)
+        self.write_network_id(writer)?;
+        self.write_network_options(writer)
     }
 }
 

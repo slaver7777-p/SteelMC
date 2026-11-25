@@ -626,40 +626,27 @@ impl World {
                         self.broadcast_movement_sync_to_entity_trackers(entity_id, packet, None);
                     },
                     self_movement: |player_id, packet| {
-                        let Some(encoded) = self.encode_movement_sync_packet(packet) else {
+                        let Some(player) = self.players.get_by_entity_id(player_id) else {
                             return;
                         };
-                        let Some(player) = self.players.get_by_entity_id(player_id) else {
+                        let version = player.connection.legacy_version();
+                        let Some(encoded) = self.encode_movement_sync_for(packet, version) else {
                             return;
                         };
                         encoded.send_to(&player);
                     },
                     entity_data: |entity_id, dirty_entity_data| {
                         let packet = CSetEntityData::new(entity_id, dirty_entity_data);
-                        let Ok(encoded) = EncodedPacket::from_bare(
-                            packet,
-                            self.compression,
-                            ConnectionProtocol::Play,
-                        ) else {
-                            return;
-                        };
-                        self.broadcast_to_entity_trackers_encoded(entity_id, encoded.clone(), None);
+                        self.broadcast_to_entity_trackers(entity_id, packet.clone(), None);
                         if let Some(player) = self.players.get_by_entity_id(entity_id) {
-                            player.connection.send_encoded(encoded);
+                            player.send_packet(packet);
                         }
                     },
                     attributes: |entity_id, dirty_attributes| {
                         let packet = CUpdateAttributes::new(entity_id, dirty_attributes);
-                        let Ok(encoded) = EncodedPacket::from_bare(
-                            packet,
-                            self.compression,
-                            ConnectionProtocol::Play,
-                        ) else {
-                            return;
-                        };
-                        self.broadcast_to_entity_trackers_encoded(entity_id, encoded.clone(), None);
+                        self.broadcast_to_entity_trackers(entity_id, packet.clone(), None);
                         if let Some(player) = self.players.get_by_entity_id(entity_id) {
-                            player.connection.send_encoded(encoded);
+                            player.send_packet(packet);
                         }
                     },
                     mob_effects: |player_id, packet| {
@@ -672,14 +659,7 @@ impl World {
                         }
                     },
                     equipment: |entity_id, packet: CSetEquipment| {
-                        let Ok(encoded) = EncodedPacket::from_bare(
-                            packet,
-                            self.compression,
-                            ConnectionProtocol::Play,
-                        ) else {
-                            return;
-                        };
-                        self.broadcast_to_entity_trackers_encoded(entity_id, encoded, None);
+                        self.broadcast_to_entity_trackers(entity_id, packet, None);
                     },
                     passengers: |player_id, packet| {
                         if let Some(player) = self.players.get_by_entity_id(player_id) {
@@ -687,14 +667,7 @@ impl World {
                         }
                     },
                     entity_link: |entity_id, packet: CSetEntityLink| {
-                        let Ok(encoded) = EncodedPacket::from_bare(
-                            packet,
-                            self.compression,
-                            ConnectionProtocol::Play,
-                        ) else {
-                            return;
-                        };
-                        self.broadcast_to_entity_trackers_encoded(entity_id, encoded, None);
+                        self.broadcast_to_entity_trackers(entity_id, packet, None);
                     },
                 },
             );

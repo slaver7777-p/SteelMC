@@ -5,6 +5,9 @@
 use glam::DVec3;
 use steel_macros::{ClientPacket, WriteTo};
 use steel_registry::packets::play::C_PLAYER_POSITION;
+use steel_utils::serial::WriteTo as _;
+
+use crate::version::MinecraftVersion;
 
 /// Relative position/rotation flags.
 ///
@@ -123,6 +126,7 @@ impl steel_utils::serial::WriteTo for RelativeMovement {
 /// position updates from the client.
 #[derive(ClientPacket, WriteTo, Clone, Debug)]
 #[packet_id(Play = C_PLAYER_POSITION)]
+#[legacy_payload]
 pub struct CPlayerPosition {
     /// Unique teleport ID that must be echoed back by the client.
     #[write(as = VarInt)]
@@ -137,6 +141,39 @@ pub struct CPlayerPosition {
     pub pitch: f32,
     /// Relative movement flags
     pub relatives: RelativeMovement,
+}
+
+impl CPlayerPosition {
+    /// Writes the body for an older client.
+    ///
+    /// Before 1.21.2 the teleport has no delta-movement field, the relative flags are a single
+    /// byte (the delta bits do not exist yet), and the teleport id is sent last rather than
+    /// first, so the field order differs from the native layout.
+    ///
+    /// # Errors
+    /// - If the packet fails to write.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl std::io::Write,
+        version: MinecraftVersion,
+    ) -> std::io::Result<()> {
+        // The delta bits (1 << 5..=1 << 8) were introduced with 1.21.2 together with the
+        // delta fields, so an older client only ever sees the five absolute-relative flags.
+        const PRE_1_21_2_FLAGS: i32 = RelativeMovement::X
+            | RelativeMovement::Y
+            | RelativeMovement::Z
+            | RelativeMovement::Y_ROT
+            | RelativeMovement::X_ROT;
+
+        if version.at_least(MinecraftVersion::V1_21_2) {
+            return self.write(writer);
+        }
+        self.pos.write(writer)?;
+        self.yaw.write(writer)?;
+        self.pitch.write(writer)?;
+        ((self.relatives.0 & PRE_1_21_2_FLAGS) as u8).write(writer)?;
+        steel_utils::codec::VarInt(self.teleport_id).write(writer)
+    }
 }
 
 impl CPlayerPosition {
@@ -195,8 +232,9 @@ impl CPlayerPosition {
 #[cfg(test)]
 mod tests {
     use glam::DVec3;
+    use steel_utils::serial::WriteTo as _;
 
-    use super::{CPlayerPosition, RelativeMovement};
+    use super::{CPlayerPosition, MinecraftVersion, RelativeMovement};
 
     #[test]
     fn delta_matches_vanilla_relative_delta_set() {
@@ -225,5 +263,73 @@ mod tests {
         assert_eq!(packet.yaw, 45.0);
         assert_eq!(packet.pitch, -10.0);
         assert_eq!(packet.relatives, RelativeMovement::NONE);
+    }
+
+    fn teleport() -> CPlayerPosition {
+        CPlayerPosition::new(
+            7,
+            DVec3::new(1.0, 64.0, -2.0),
+            DVec3::new(0.1, 0.2, 0.3),
+            90.0,
+            10.0,
+            RelativeMovement::DELTA,
+        )
+    }
+
+    #[test]
+    fn payload_from_1_21_2_matches_native() {
+        let packet = teleport();
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21_2)
+            .expect("legacy payload should encode");
+        let mut native = Vec::new();
+        packet
+            .write(&mut native)
+            .expect("native payload should encode");
+        assert_eq!(legacy, native);
+    }
+
+    #[test]
+    fn payload_before_1_21_2_drops_delta_and_moves_teleport_id_last() {
+        let packet = teleport();
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21)
+            .expect("legacy payload should encode");
+
+        // pos(24) + yaw(4) + pitch(4) + flags(1) + teleport id VarInt(1) = 34. The native
+        // layout instead leads with the teleport id and carries three delta doubles.
+        assert_eq!(legacy.len(), 24 + 4 + 4 + 1 + 1);
+        // The packet was built with only delta flags, which do not exist before 1.21.2.
+        assert_eq!(
+            legacy[32], 0,
+            "delta flag bits must not reach an older client"
+        );
+        assert_eq!(legacy[33], 7, "teleport id is sent last");
+
+        let mut native = Vec::new();
+        packet
+            .write(&mut native)
+            .expect("native payload should encode");
+        assert!(
+            native.len() > legacy.len(),
+            "native carries the delta fields"
+        );
+    }
+
+    #[test]
+    fn payload_before_1_21_2_keeps_absolute_relative_flags() {
+        let mut packet = teleport();
+        packet.relatives = RelativeMovement::ROTATION;
+        let mut legacy = Vec::new();
+        packet
+            .write_payload_legacy(&mut legacy, MinecraftVersion::V1_21)
+            .expect("legacy payload should encode");
+        assert_eq!(
+            legacy[32],
+            (RelativeMovement::Y_ROT | RelativeMovement::X_ROT) as u8,
+            "rotation flags predate 1.21.2 and must be sent"
+        );
     }
 }

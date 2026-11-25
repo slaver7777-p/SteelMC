@@ -6,6 +6,7 @@ use super::{
     NetworkConnection, PLAYER_INFO_INIT_ACTIONS, PendingWorldChangeToken, PersistentPlayerData,
     Player, PlayerInfoEntry, ResetReason, SegQueue, Server, SyncMutex, Uuid, mpsc,
 };
+use steel_protocol::packet_traits::VersionCache;
 
 pub(super) struct PendingPlayerJoin {
     pub(super) player: Arc<Player>,
@@ -659,14 +660,21 @@ impl Server {
     }
 
     /// Broadcasts a packet to every online player, regardless of world membership.
-    pub fn broadcast_to_online<P: ClientPacket>(&self, packet: P) {
-        let Ok(encoded) =
-            EncodedPacket::from_bare(packet, self.config.compression, ConnectionProtocol::Play)
-        else {
-            return;
-        };
+    pub fn broadcast_to_online<P: ClientPacket + Clone>(&self, packet: P) {
+        let mut cache = VersionCache::new();
         self.online_players.iter_players(|_, player| {
-            player.connection.send_encoded(encoded.clone());
+            let version = player.connection.legacy_version();
+            let encoded = cache.get_or_insert_with(version, || {
+                EncodedPacket::from_bare_optional(
+                    packet.clone(),
+                    self.config.compression,
+                    ConnectionProtocol::Play,
+                    version,
+                )
+            });
+            if let Some(encoded) = encoded {
+                player.connection.send_encoded(encoded);
+            }
             true
         });
     }
