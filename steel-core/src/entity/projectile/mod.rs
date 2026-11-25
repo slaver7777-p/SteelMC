@@ -912,6 +912,7 @@ fn clip_segment(aabb: WorldAabb, from: DVec3, to: DVec3) -> Option<DVec3> {
     let direction = to - from;
     let mut t_min = 0.0_f64;
     let mut t_max = 1.0_f64;
+    let mut entered = false;
 
     for axis in [Axis::X, Axis::Y, Axis::Z] {
         let start = axis_component(from, axis);
@@ -933,11 +934,18 @@ fn clip_segment(aabb: WorldAabb, from: DVec3, to: DVec3) -> Option<DVec3> {
             mem::swap(&mut low, &mut high);
         }
 
-        t_min = t_min.max(low);
+        if low > t_min {
+            t_min = low;
+            entered = true;
+        }
         t_max = t_max.min(high);
         if t_min > t_max {
             return None;
         }
+    }
+
+    if !entered {
+        return None;
     }
 
     Some(from + direction * t_min)
