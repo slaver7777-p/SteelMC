@@ -488,13 +488,13 @@ pub trait LivingEntity: Entity {
             matches_target = target_type == &vanilla_entities::SKELETON
                 && item_stack.is(&vanilla_items::SKELETON_SKULL)
                 || target_type == &vanilla_entities::ZOMBIE
-                    && item_stack.is(&vanilla_items::ZOMBIE_HEAD)
+                && item_stack.is(&vanilla_items::ZOMBIE_HEAD)
                 || target_type == &vanilla_entities::PIGLIN
-                    && item_stack.is(&vanilla_items::PIGLIN_HEAD)
+                && item_stack.is(&vanilla_items::PIGLIN_HEAD)
                 || target_type == &vanilla_entities::PIGLIN_BRUTE
-                    && item_stack.is(&vanilla_items::PIGLIN_HEAD)
+                && item_stack.is(&vanilla_items::PIGLIN_HEAD)
                 || target_type == &vanilla_entities::CREEPER
-                    && item_stack.is(&vanilla_items::CREEPER_HEAD);
+                && item_stack.is(&vanilla_items::CREEPER_HEAD);
         });
         matches_target
     }
@@ -514,8 +514,8 @@ pub trait LivingEntity: Entity {
     fn can_attack(&self, target: &dyn LivingEntity) -> bool {
         if target.entity_type() == &vanilla_entities::PLAYER
             && self
-                .level()
-                .is_some_and(|world| world.difficulty() == Difficulty::Peaceful)
+            .level()
+            .is_some_and(|world| world.difficulty() == Difficulty::Peaceful)
         {
             return false;
         }
@@ -613,9 +613,9 @@ pub trait LivingEntity: Entity {
         }
         if source.damage_type == &vanilla_damage_types::WIND_CHARGE
             && REGISTRY.entity_types.is_in_tag(
-                self.entity_type(),
-                &EntityTypeTag::NO_ANGER_FROM_WIND_CHARGE,
-            )
+            self.entity_type(),
+            &EntityTypeTag::NO_ANGER_FROM_WIND_CHARGE,
+        )
         {
             return;
         }
@@ -735,8 +735,8 @@ pub trait LivingEntity: Entity {
         let blocked = damage_blocked > 0.0;
         if source.is(&vanilla_damage_type_tags::DamageTypeTag::IS_FREEZING)
             && REGISTRY
-                .entity_types
-                .is_in_tag(self.entity_type(), &EntityTypeTag::FREEZE_HURTS_EXTRA_TYPES)
+            .entity_types
+            .is_in_tag(self.entity_type(), &EntityTypeTag::FREEZE_HURTS_EXTRA_TYPES)
         {
             damage *= 5.0;
         }
@@ -866,8 +866,8 @@ pub trait LivingEntity: Entity {
         if damage_blocked > 0.0
             && !source.is(&vanilla_damage_type_tags::DamageTypeTag::IS_PROJECTILE)
             && let Some(attacker) = source
-                .direct_entity()
-                .and_then(|entity| entity.as_living_entity())
+            .direct_entity()
+            .and_then(|entity| entity.as_living_entity())
         {
             self.block_using_item(world, attacker, source, damage, damage_blocked >= damage);
         }
@@ -1388,8 +1388,8 @@ pub trait LivingEntity: Entity {
 
         let should_drop = self.is_always_experience_dropper()
             || self.last_hurt_by_player_memory_time() > 0
-                && self.should_drop_experience()
-                && world.get_game_rule(&MOB_DROPS);
+            && self.should_drop_experience()
+            && world.get_game_rule(&MOB_DROPS);
         if !should_drop {
             return;
         }
@@ -1715,8 +1715,8 @@ pub trait LivingEntity: Entity {
 
             if effect.should_apply_effect_tick_this_tick(self.tick_count())
                 && world
-                    .as_deref()
-                    .is_some_and(|world| !effect.apply_effect_tick(world, dyn_self))
+                .as_deref()
+                .is_some_and(|world| !effect.apply_effect_tick(world, dyn_self))
             {
                 self.remove_mob_effect(effect.effect());
                 continue;
@@ -2127,7 +2127,7 @@ pub trait LivingEntity: Entity {
         InteractionResult::Success
     }
 
-    /// Refreshes transient item attribute modifiers for one equipment slot.
+    /// Refreshes transient item and enchantment attribute modifiers for one equipment slot.
     fn refresh_equipment_attribute_modifiers(&self, slot: EquipmentSlot) {
         self.with_equipment_slot(slot, &mut |item_stack| {
             self.living_base()
@@ -2387,8 +2387,8 @@ pub trait LivingEntity: Entity {
             && !self.is_passenger()
             && !self.has_mob_effect(vanilla_mob_effects::LEVITATION)
             && EquipmentSlot::ALL
-                .iter()
-                .any(|&slot| self.can_glide_using_equipment_slot(slot))
+            .iter()
+            .any(|&slot| self.can_glide_using_equipment_slot(slot))
     }
 
     /// Returns whether the entity currently meets the conditions to glide with an elytra.
@@ -2441,7 +2441,7 @@ pub trait LivingEntity: Entity {
 
         let climbable = block.has_tag(&BlockTag::CLIMBABLE)
             || block.has_tag(&BlockTag::TRAPDOORS)
-                && trapdoor_usable_as_ladder_state(state, world.get_block_state(pos.below()));
+            && trapdoor_usable_as_ladder_state(state, world.get_block_state(pos.below()));
 
         if climbable {
             self.set_last_climbable_pos(Some(pos));
@@ -2588,10 +2588,10 @@ pub trait LivingEntity: Entity {
             self.set_velocity(
                 self.velocity()
                     + DVec3::new(
-                        -f64::from(trig::sin(angle)) * 0.2,
-                        0.0,
-                        f64::from(trig::cos(angle)) * 0.2,
-                    ),
+                    -f64::from(trig::sin(angle)) * 0.2,
+                    0.0,
+                    f64::from(trig::cos(angle)) * 0.2,
+                ),
             );
         }
 
@@ -2905,8 +2905,8 @@ pub trait LivingEntity: Entity {
         let mut movement = self.velocity();
         if (result.horizontal_collision || self.is_jumping())
             && (self.on_climbable()
-                || self.was_in_powder_snow()
-                    && PowderSnowBlock::can_entity_walk_on_powder_snow(self))
+            || self.was_in_powder_snow()
+            && PowderSnowBlock::can_entity_walk_on_powder_snow(self))
         {
             movement.y = 0.2;
         }
@@ -3341,14 +3341,14 @@ pub trait LivingEntity: Entity {
                     facing,
                     bed_position,
                 )
-                .unwrap_or_else(|| {
-                    let above = bed_position.above();
-                    DVec3::new(
-                        f64::from(above.x()) + 0.5,
-                        f64::from(above.y()) + 0.1,
-                        f64::from(above.z()) + 0.5,
-                    )
-                });
+                    .unwrap_or_else(|| {
+                        let above = bed_position.above();
+                        DVec3::new(
+                            f64::from(above.x()) + 0.5,
+                            f64::from(above.y()) + 0.1,
+                            f64::from(above.z()) + 0.5,
+                        )
+                    });
                 let bed_center = DVec3::new(
                     f64::from(bed_position.x()) + 0.5,
                     f64::from(bed_position.y()),

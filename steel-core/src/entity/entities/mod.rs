@@ -13,7 +13,7 @@ pub use objects::items::{ExperienceOrbEntity, FallingBlockEntity, ItemEntity};
 pub use objects::projectiles::{
     EnderPearlEntity, EyeOfEnderEntity, FireworkRocketEntity, FishingHookEntity,
     LingeringPotionEntity, SmallFireballEntity, SnowballEntity, SplashPotionEntity,
-    ThrownEggEntity, WindChargeEntity,
+    ThrownEggEntity, WindChargeEntity, ThrownExperienceBottleEntity
 };
 pub use objects::technical::{
     Alignment, BillboardConstraints, BlockDisplayEntity, BlockDisplayView, Brightness, Display,

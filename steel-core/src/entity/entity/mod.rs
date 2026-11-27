@@ -1073,13 +1073,13 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
                 );
             }
             Some(PortalProcessResult::Waiting)
-                if self
-                    .base()
-                    .portal_process()
-                    .is_some_and(PortalProcessor::has_expired) =>
-            {
-                self.base().clear_portal_process();
-            }
+            if self
+                .base()
+                .portal_process()
+                .is_some_and(PortalProcessor::has_expired) =>
+                {
+                    self.base().clear_portal_process();
+                }
             Some(PortalProcessResult::Waiting) | None => {}
         }
     }
@@ -1146,10 +1146,14 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         } else {
             0
         };
+        let ignite_ticks = effect_type
+            .ignite_ticks()
+            .map_or(0, |ticks| self.scaled_ignite_ticks(ticks));
         self.base().apply_inside_block_effect(
             effect_type,
             self.can_freeze(),
             self.fire_immune(),
+            ignite_ticks,
             fire_ignite_extra_ticks,
             self.ticks_required_to_freeze(),
             self.remaining_fire_ticks_cap(),
@@ -1237,8 +1241,8 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         (ignore_passenger || !self.is_passenger())
             && self.is_alive()
             && !self
-                .as_living_entity()
-                .is_some_and(LivingEntity::is_sleeping)
+            .as_living_entity()
+            .is_some_and(LivingEntity::is_sleeping)
     }
 
     /// Returns vanilla's dimension-changing portal cooldown delay in ticks.
@@ -1433,8 +1437,8 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
                 };
                 if !equippable.can_be_sheared
                     || !has_infinite_materials
-                        && item_stack
-                            .has_enchantment_effect(EnchantmentEffectComponent::PreventArmorChange)
+                    && item_stack
+                    .has_enchantment_effect(EnchantmentEffectComponent::PreventArmorChange)
                 {
                     continue;
                 }
@@ -1503,8 +1507,8 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         if player.is_secondary_use_active()
             && mob.can_be_leashed()
             && self
-                .as_living_entity()
-                .is_none_or(|living| !LivingEntity::is_baby(living))
+            .as_living_entity()
+            .is_none_or(|living| !LivingEntity::is_baby(living))
             && self.transfer_leashables_from_holder(player)
         {
             if let Some(world) = self.level() {
@@ -1649,9 +1653,9 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     fn is_same_entity(&self, other: &dyn Entity) -> bool {
         self.id() == other.id()
             || self
-                .as_part_entity()
-                .and_then(PartEntity::parent)
-                .is_some_and(|parent| parent.id() == other.id())
+            .as_part_entity()
+            .and_then(PartEntity::parent)
+            .is_some_and(|parent| parent.id() == other.id())
     }
 
     /// Returns this entity as a player when it is the concrete server player.
@@ -2056,8 +2060,8 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
                 .get_item_in_hand(InteractionHand::OffHand)
                 .is(item)
                 && !inventory
-                    .get_item_in_hand(InteractionHand::MainHand)
-                    .is(item)
+                .get_item_in_hand(InteractionHand::MainHand)
+                .is(item)
         };
         let main_arm = player.client_information().main_hand;
         let item_arm = if item_only_in_offhand {
@@ -2319,10 +2323,24 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         self.clear_fire();
     }
 
+    /// Scales an ignite duration by `BURNING_TIME` for living entities, matching
+    /// vanilla's `LivingEntity.igniteForTicks` override.
+    fn scaled_ignite_ticks(&self, number_of_ticks: i32) -> i32 {
+        self.as_living_entity().map_or(number_of_ticks, |living| {
+            let burning_time = living
+                .attributes()
+                .lock()
+                .required_value(vanilla_attributes::BURNING_TIME);
+            (f64::from(number_of_ticks) * burning_time).ceil() as i32
+        })
+    }
+
     /// Ignites this entity for a vanilla tick duration.
     fn ignite_for_ticks(&self, number_of_ticks: i32) {
-        self.base()
-            .ignite_for_ticks(number_of_ticks, self.remaining_fire_ticks_cap());
+        self.base().ignite_for_ticks(
+            self.scaled_ignite_ticks(number_of_ticks),
+            self.remaining_fire_ticks_cap(),
+        );
         self.sync_base_fire_freeze_entity_data();
     }
 
@@ -2367,10 +2385,10 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
         let pos = self.block_position();
         world.is_raining_at(pos)
             || world.is_raining_at(BlockPos::new(
-                pos.x(),
-                self.bounding_box().max_y().floor() as i32,
-                pos.z(),
-            ))
+            pos.x(),
+            self.bounding_box().max_y().floor() as i32,
+            pos.z(),
+        ))
     }
 
     /// Returns true if this entity is touching water or standing in rain.
@@ -2951,7 +2969,7 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
             && !self.no_physics()
             && is_small
             && (new_dimensions.width > old_dimensions.width
-                || new_dimensions.height > old_dimensions.height)
+            || new_dimensions.height > old_dimensions.height)
             && self.as_player().is_none()
         {
             self.fudge_position_after_size_change(old_dimensions);
@@ -3022,10 +3040,10 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
             ) {
                 let new_position = free_center
                     + DVec3::new(
-                        0.0,
-                        -f64::from(previous_dimensions.height) / 2.0 + FUDGE_POSITION_EPSILON,
-                        0.0,
-                    );
+                    0.0,
+                    -f64::from(previous_dimensions.height) / 2.0 + FUDGE_POSITION_EPSILON,
+                    0.0,
+                );
                 return self.try_set_position(new_position).is_ok();
             }
         }
@@ -4171,11 +4189,11 @@ pub trait Entity: EntityEventSource + ErasedType + Send + Sync + 'static {
     fn is_invulnerable_to_base(&self, source: &DamageSource) -> bool {
         self.is_removed()
             || self.is_invulnerable()
-                && !source.bypasses_invulnerability()
-                && !source.is_creative_player()
+            && !source.bypasses_invulnerability()
+            && !source.is_creative_player()
             || source.is(&vanilla_damage_type_tags::DamageTypeTag::IS_FIRE) && self.fire_immune()
             || source.is(&vanilla_damage_type_tags::DamageTypeTag::IS_FALL)
-                && self.is_fall_damage_immune()
+            && self.is_fall_damage_immune()
     }
 
     /// Applies damage to this entity.

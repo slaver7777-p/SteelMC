@@ -1,9 +1,18 @@
+use std::io::{self, Write};
+
 use glam::DVec3;
 use steel_macros::{ClientPacket, WriteTo};
 use steel_registry::{
     packets::play::C_EXPLODE, particle_type::ParticleData, sound_event::SoundEventHolder,
 };
+use steel_utils::codec::VarInt;
+use steel_utils::serial::WriteTo;
 use thiserror::Error;
+
+use crate::version::MinecraftVersion;
+
+/// Vanilla's `Explosion.BlockInteraction.KEEP` ordinal.
+const BLOCK_INTERACTION_KEEP: i32 = 0;
 
 /// A block-debris particle and the client-side scaling applied to it.
 #[derive(WriteTo, Clone, Debug)]
@@ -72,6 +81,7 @@ pub enum ExplosionParticleWeightError {
 /// Sent to apply the client-visible effects of a server-side explosion.
 #[derive(ClientPacket, WriteTo, Clone, Debug)]
 #[packet_id(Play = C_EXPLODE)]
+#[legacy_payload]
 pub struct CExplode {
     pub center: DVec3,
     pub radius: f32,
@@ -81,6 +91,80 @@ pub struct CExplode {
     pub explosion_sound: SoundEventHolder,
     pub block_particles: ExplosionParticlePalette,
     pub play_sound: bool,
+}
+
+impl CExplode {
+    /// Writes the body for a client on an older protocol version.
+    ///
+    /// Wire layout evolved through four stages:
+    ///
+    /// **1.21** — `ClientboundExplodePacket` was still a plain class: center
+    /// (double×3), radius (float), the destroyed `List<BlockPos>`, knockback as
+    /// three `float`s, a `BlockInteraction` ordinal, the small particle, the large
+    /// particle, and finally the sound holder.
+    ///
+    /// **1.21.2–1.21.8** — the packet became a record of (center,
+    /// `Optional<Vec3>` knockback, particle, sound). Radius, block count, the
+    /// weighted list, and `playSound` do not exist yet.
+    ///
+    /// **1.21.9–26.2** — the record gained radius, `blockCount`, `playerKnockback`,
+    /// and the `WeightedList<ExplosionParticleInfo>` block-particle palette.
+    ///
+    /// **26.3+** — the record gained a trailing `playSound` boolean.
+    ///
+    /// # Errors
+    /// - If the packet fails to write.
+    pub fn write_payload_legacy(
+        &self,
+        writer: &mut impl Write,
+        version: MinecraftVersion,
+    ) -> io::Result<()> {
+        if version.at_least(MinecraftVersion::V26_3) {
+            return self.write(writer);
+        }
+
+        if version.at_least(MinecraftVersion::V1_21_9) {
+            self.center.write(writer)?;
+            self.radius.write(writer)?;
+            self.block_count.write(writer)?;
+            self.player_knockback.write(writer)?;
+            self.explosion_particle.write(writer)?;
+            self.explosion_sound.write(writer)?;
+            self.block_particles.write(writer)?;
+            return Ok(());
+        }
+
+        if version.at_least(MinecraftVersion::V1_21_2) {
+            self.center.write(writer)?;
+            self.player_knockback.write(writer)?;
+            self.explosion_particle.write(writer)?;
+            self.explosion_sound.write(writer)?;
+            return Ok(());
+        }
+
+        // 1.21: old format — center (double×3), radius (float),
+        // List<BlockPos> (empty in Steel), knockback (float×3),
+        // BlockInteraction enum (ordinal), small particle, large particle, sound.
+        self.center.write(writer)?;
+        self.radius.write(writer)?;
+        // Block list is always empty — Steel doesn't track per-block positions.
+        VarInt(0).write(writer)?;
+        // Knockback: Vanilla's `g`, `h`, `i` fields are three `float`s.
+        let knockback = self.player_knockback.unwrap_or(DVec3::ZERO);
+        (knockback.x as f32).write(writer)?;
+        (knockback.y as f32).write(writer)?;
+        (knockback.z as f32).write(writer)?;
+        // BlockInteraction enum: ordinal 0 = KEEP (no blocks affected).
+        VarInt(BLOCK_INTERACTION_KEEP).write(writer)?;
+        // Vanilla 1.21 carries both the small and the large explosion particle; the
+        // client picks one from the radius and whether blocks were hit. Steel resolves
+        // that choice server-side, so both slots carry the same particle.
+        self.explosion_particle.write(writer)?;
+        self.explosion_particle.write(writer)?;
+        // Sound.
+        self.explosion_sound.write(writer)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +179,7 @@ mod tests {
     use super::{
         CExplode, ExplosionParticleInfo, ExplosionParticlePalette, ExplosionParticleWeightError,
     };
+    use crate::version::MinecraftVersion;
 
     #[test]
     fn writes_fields_in_vanilla_wire_order() {
@@ -227,5 +312,163 @@ mod tests {
             panic!("test registry id should fit in i32");
         };
         assert!(VarInt(id).write(output).is_ok());
+    }
+
+    fn sample_packet() -> CExplode {
+        CExplode {
+            center: DVec3::new(1.25, -2.5, 3.75),
+            radius: 4.0,
+            block_count: 17,
+            player_knockback: Some(DVec3::new(-0.25, 0.5, 1.0)),
+            explosion_particle: ParticleData::simple(&vanilla_particle_types::EXPLOSION),
+            explosion_sound: SoundEventHolder::registry(&sound_events::ENTITY_GENERIC_EXPLODE),
+            block_particles: palette(vec![(
+                ExplosionParticleInfo {
+                    particle: ParticleData::simple(&vanilla_particle_types::POOF),
+                    scaling: 0.5,
+                    speed: 1.0,
+                },
+                2,
+            )]),
+            play_sound: true,
+        }
+    }
+
+    fn encode_legacy(packet: &CExplode, version: MinecraftVersion) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        packet
+            .write_payload_legacy(&mut bytes, version)
+            .expect("legacy payload should encode");
+        bytes
+    }
+
+    fn write_center(output: &mut Vec<u8>, center: DVec3) {
+        output.extend_from_slice(&center.x.to_be_bytes());
+        output.extend_from_slice(&center.y.to_be_bytes());
+        output.extend_from_slice(&center.z.to_be_bytes());
+    }
+
+    fn write_knockback_f32(output: &mut Vec<u8>, knockback: Option<DVec3>) {
+        let knockback = knockback.unwrap_or(DVec3::ZERO);
+        output.extend_from_slice(&(knockback.x as f32).to_be_bytes());
+        output.extend_from_slice(&(knockback.y as f32).to_be_bytes());
+        output.extend_from_slice(&(knockback.z as f32).to_be_bytes());
+    }
+
+    #[test]
+    fn legacy_payload_26_3_matches_native() {
+        init_vanilla_registry();
+        let packet = sample_packet();
+        let mut native = Vec::new();
+        packet.write(&mut native).expect("native encode");
+        assert_eq!(encode_legacy(&packet, MinecraftVersion::V26_3), native);
+    }
+
+    #[test]
+    fn legacy_payload_26_2_drops_only_play_sound() {
+        init_vanilla_registry();
+        let packet = sample_packet();
+
+        let mut expected = Vec::new();
+        write_center(&mut expected, packet.center);
+        expected.extend_from_slice(&packet.radius.to_be_bytes());
+        expected.extend_from_slice(&packet.block_count.to_be_bytes());
+        expected.push(1);
+        write_center(&mut expected, DVec3::new(-0.25, 0.5, 1.0));
+        write_registry_id(&mut expected, vanilla_particle_types::EXPLOSION.id());
+        assert!(
+            VarInt(sound_events::ENTITY_GENERIC_EXPLODE.packet_holder_id())
+                .write(&mut expected)
+                .is_ok()
+        );
+        assert!(VarInt(1).write(&mut expected).is_ok());
+        write_registry_id(&mut expected, vanilla_particle_types::POOF.id());
+        expected.extend_from_slice(&0.5_f32.to_be_bytes());
+        expected.extend_from_slice(&1.0_f32.to_be_bytes());
+        assert!(VarInt(2).write(&mut expected).is_ok());
+
+        assert_eq!(encode_legacy(&packet, MinecraftVersion::V26_2), expected);
+    }
+
+    #[test]
+    fn legacy_payload_1_21_9_has_weighted_list_no_play_sound() {
+        init_vanilla_registry();
+        let packet = sample_packet();
+
+        let mut expected = Vec::new();
+        write_center(&mut expected, packet.center);
+        expected.extend_from_slice(&packet.radius.to_be_bytes());
+        expected.extend_from_slice(&packet.block_count.to_be_bytes());
+        expected.push(1);
+        write_center(&mut expected, DVec3::new(-0.25, 0.5, 1.0));
+        write_registry_id(&mut expected, vanilla_particle_types::EXPLOSION.id());
+        assert!(
+            VarInt(sound_events::ENTITY_GENERIC_EXPLODE.packet_holder_id())
+                .write(&mut expected)
+                .is_ok()
+        );
+        // WeightedList: VarInt(1), POOF id, scaling f32, speed f32, weight VarInt(2)
+        assert!(VarInt(1).write(&mut expected).is_ok());
+        write_registry_id(&mut expected, vanilla_particle_types::POOF.id());
+        expected.extend_from_slice(&0.5_f32.to_be_bytes());
+        expected.extend_from_slice(&1.0_f32.to_be_bytes());
+        assert!(VarInt(2).write(&mut expected).is_ok());
+
+        assert_eq!(encode_legacy(&packet, MinecraftVersion::V1_21_9), expected);
+    }
+
+    #[test]
+    fn legacy_payload_1_21_2_keeps_center_knockback_particle_sound() {
+        init_vanilla_registry();
+        let packet = sample_packet();
+
+        let mut expected = Vec::new();
+        write_center(&mut expected, packet.center);
+        expected.push(1);
+        write_center(&mut expected, DVec3::new(-0.25, 0.5, 1.0));
+        write_registry_id(&mut expected, vanilla_particle_types::EXPLOSION.id());
+        assert!(
+            VarInt(sound_events::ENTITY_GENERIC_EXPLODE.packet_holder_id())
+                .write(&mut expected)
+                .is_ok()
+        );
+
+        assert_eq!(encode_legacy(&packet, MinecraftVersion::V1_21_2), expected);
+    }
+
+    #[test]
+    fn legacy_payload_1_21_uses_block_list_enum_and_two_particles() {
+        init_vanilla_registry();
+        let packet = sample_packet();
+
+        let mut expected = Vec::new();
+        write_center(&mut expected, packet.center);
+        expected.extend_from_slice(&packet.radius.to_be_bytes());
+        expected.push(0); // empty block list
+        write_knockback_f32(&mut expected, packet.player_knockback);
+        expected.push(0); // BlockInteraction.KEEP ordinal
+        write_registry_id(&mut expected, vanilla_particle_types::EXPLOSION.id());
+        write_registry_id(&mut expected, vanilla_particle_types::EXPLOSION.id());
+        assert!(
+            VarInt(sound_events::ENTITY_GENERIC_EXPLODE.packet_holder_id())
+                .write(&mut expected)
+                .is_ok()
+        );
+
+        assert_eq!(encode_legacy(&packet, MinecraftVersion::V1_21), expected);
+    }
+
+    #[test]
+    fn legacy_payload_1_21_writes_zero_knockback_when_absent() {
+        init_vanilla_registry();
+        let packet = CExplode {
+            player_knockback: None,
+            ..sample_packet()
+        };
+
+        let legacy = encode_legacy(&packet, MinecraftVersion::V1_21);
+        // center (24) + radius (4) + empty block list (1) = 29 bytes before knockback.
+        let knockback = &legacy[29..41];
+        assert_eq!(knockback, &[0_u8; 12]);
     }
 }

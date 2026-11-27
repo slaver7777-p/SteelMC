@@ -46,7 +46,9 @@ mod wind_charge;
 mod fishing_rod;
 mod flint_and_steel;
 mod lead;
+mod experience_bottle;
 
+pub use experience_bottle::ExperienceBottleItem;
 pub use air::AirItem;
 pub use block_item::{BlockItem, DoubleHighBlockItem};
 pub use bonemeal::BoneMealItem;
